@@ -69,3 +69,12 @@ This tool is designed to be ethical and GDPR-friendly. It exclusively uses free,
 
 ## License
 This project is licensed under the terms provided in the LICENSE file.
+
+## 🐳 Docker Support
+
+Run the system seamlessly using Docker:
+
+`ash
+docker compose build
+docker compose run dispatch --help
+`

@@ -1,8 +1,14 @@
-FROM python:3.10-slim
+FROM python:3.9-slim
+
 WORKDIR /app
-COPY requirements.txt ./
+
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Set encoding to avoid terminal rendering issues with box-drawing characters
+ENV PYTHONIOENCODING=utf-8
+
 COPY . .
-ENV PYTHONUNBUFFERED=1
-EXPOSE 8000
-CMD ["python", "main.py"]
+
+ENTRYPOINT ["python", "lead_dispatch_system.py"]
+CMD ["--help"]
