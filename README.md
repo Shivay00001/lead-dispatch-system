@@ -1,80 +1,147 @@
 # Universal Lead & Worker Dispatch Automation (ULWDA) v2.0
 
-A production-ready, zero-cost automation system for lead extraction, worker management, and job dispatch across any industry (hotels, plumbing, cleaning, maintenance, logistics, delivery, etc.).
+Lead extraction (OpenStreetMap/Nominatim), worker management, distance-based
+job matching, and WhatsApp/SMTP email outreach — backed by a local SQLite
+database. CLI-first; no servers, no HTTP endpoints.
 
-## 🚀 Key Features
+## 🚀 Quick start (fresh clone)
 
-- **Lead Collection**: Automatically extract business leads from OpenStreetMap using the Nominatim API.
-- **Worker Management**: Import and register service workers with their specific skills and geographic coordinates via CSV.
-- **Auto-Matching**: Automatically matches collected business leads with the nearest available workers based on Haversine distance.
-- **Automated Outreach**: Send WhatsApp messages (via `pywhatkit`) and emails directly to matched leads.
-- **Local Secure Storage**: Uses a secure local SQLite database for data persistence and caching to avoid API rate limits.
-- **Multi-lingual Templates**: Built-in support for Hindi and English professional outreach messages.
+```bash
+git clone https://github.com/Shivay00001/lead-dispatch-system.git
+cd lead-dispatch-system
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 
-## ⚙️ Prerequisites
+# 1. Configure (copy the example, fill in your values)
+cp .env.example .env
 
-- Python 3.9+
-- A modern terminal/command prompt supporting UTF-8 (set `PYTHONIOENCODING=utf-8` if on Windows)
-- `requests` and `pywhatkit` packages
+# 2. Verify the install
+python lead_dispatch_system.py --help
+python lead_dispatch_system.py stats
+```
 
-## 📦 Installation
+That's it — no tribal knowledge. The SQLite database (`ulwda_production.db`
+by default) is created automatically on first run.
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/Shivay00001/lead-dispatch-system.git
-   cd lead-dispatch-system
-   ```
+## ⚙️ Configuration — environment variables
 
-2. Install the required dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+All secrets and deployment settings come from environment variables or a `.env`
+file in the working directory. **Nothing is hardcoded** — SMTP credentials
+especially. A legacy `--smtp-config <file.json>` override is still accepted
+for `send-email`.
+
+| Variable               | Required | Default                  | Purpose                                          |
+|------------------------|----------|--------------------------|--------------------------------------------------|
+| `LEAD_DISPATCH_DB`     | no       | `ulwda_production.db`    | Path to the SQLite database file                 |
+| `SMTP_HOST`            | yes¹     | `smtp.gmail.com`         | SMTP server hostname                             |
+| `SMTP_PORT`            | no       | `587`                    | SMTP port (STARTTLS)                             |
+| `SMTP_USER`            | yes¹     | —                        | SMTP login (e.g. your Gmail address)             |
+| `SMTP_PASS`            | yes¹     | —                        | SMTP password — **use a Gmail App Password**, never your real login password |
+| `SMTP_MIN_GAP_SECONDS` | no       | `30`                     | Min seconds between outbound emails in one run (abuse throttle; `0` disables) |
+
+¹ required only for `send-email`. Gmail: enable 2-Step Verification, then
+create an App Password at https://myaccount.google.com/apppasswords.
+
+> `.env` is git-ignored — never commit it. `.env.example` shows every variable
+> with dummy placeholder values.
 
 ## 💻 Usage
 
-Run the ULWDA system through the command-line interface `lead_dispatch_system.py`.
-
-### 1. Collect Leads
-Extract leads for a specific service in a specific city:
 ```bash
+# Collect leads for a service in a city
 python lead_dispatch_system.py collect --city "Mumbai" --service "hotel" --limit 20
-```
 
-### 2. Import Workers
-Import your worker database from a CSV file (format: `name,skills,phone,email,lat,lon`):
-```bash
+# Import workers (CSV: name,skills,phone,email,lat,lon)
 python lead_dispatch_system.py import-workers workers.csv
-```
 
-### 3. Auto-Match Jobs
-Assign the nearest registered workers to your collected leads:
-```bash
+# Manually add one worker
+python lead_dispatch_system.py add-worker --name "Ravi" --skills "plumbing" --phone "+919876543210"
+
+# Auto-match nearest workers to new leads
 python lead_dispatch_system.py match --service "plumbing"
-```
 
-### 4. Send Outreach
-Message the matched leads via WhatsApp or Email:
-```bash
+# Send outreach (email needs SMTP configured; WhatsApp opens WhatsApp Web)
+python lead_dispatch_system.py send-email 1 --city "Mumbai" --service "plumbing"
 python lead_dispatch_system.py send-whatsapp 1 --city "Mumbai" --service "plumbing"
+
+# Inspect
+python lead_dispatch_system.py list-leads
+python lead_dispatch_system.py list-workers
+python lead_dispatch_system.py list-jobs
+python lead_dispatch_system.py stats        # alias: status
+python lead_dispatch_system.py cleanup
+
+# Export to CSV
+python lead_dispatch_system.py export --type leads --output leads.csv
 ```
 
-### View Stats & Help
+Exit codes: `0` on success, non-zero on failure (e.g. `1` when an email can't
+be sent). Errors print as `❌ ERROR: <what happened>` — stack traces are
+never shown to end users; internal events are logged to the `system_logs`
+table in the database.
+
+## 🐳 Docker
+
 ```bash
-python lead_dispatch_system.py stats
-python lead_dispatch_system.py --help
+cp .env.example .env   # fill in SMTP creds
+docker compose build
+docker compose run --rm dispatch stats
+docker compose run --rm dispatch collect --city "Mumbai" --service hotel --limit 20
 ```
 
-## ⚖️ Ethical & Legal Use
-This tool is designed to be ethical and GDPR-friendly. It exclusively uses free, legal, and open-source APIs like OpenStreetMap, avoids scraping proprietary maps, implements strict API rate limiting, and securely hashes sensitive metrics. Always ensure you comply with local anti-spam and telemarketing regulations before contacting leads.
+The database persists in the `lead_data` volume (mounted at `/data`, with
+`LEAD_DISPATCH_DB=/data/ulwda_production.db` set in compose).
+
+## ☁️ Deploying on Render (cron worker)
+
+This repo is CLI-only (no web service), so deploy it as a **Render Cron Job**
+or **Background Worker**:
+
+1. Push the repo to GitHub, create a new **Cron Job** on Render from it.
+2. Build command: `pip install -r requirements.txt`
+3. Command (example — collect + match daily at 6:00 UTC):
+   `python lead_dispatch_system.py collect --city "Mumbai" --service "hotel" --limit 50 && python lead_dispatch_system.py match --service hotel`
+4. Set a schedule (cron expression) in the Render dashboard.
+5. Add environment variables in the Render dashboard (don't commit `.env`):
+   `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `SMTP_MIN_GAP_SECONDS`,
+   and optionally `LEAD_DISPATCH_DB=/var/data/ulwda_production.db`.
+6. Attach a **Persistent Disk** mounted at `/var/data` so the SQLite database
+   survives between cron runs.
+
+For outbound email in a worker: keep `SMTP_MIN_GAP_SECONDS` ≥ 30 so one run
+can't blast the inbox provider's limits.
+
+## ⏱️ Rate limits & abuse safety
+
+- **Nominatim (lead collection):** hard-capped at 1 request per
+  `API_RATE_LIMIT_SECONDS` (1.2s) — complies with the OpenStreetMap usage
+  policy (max 1 req/sec). Results are cached 24h in the `api_cache` table.
+- **Email:** at most one send per `SMTP_MIN_GAP_SECONDS` (default 30s) inside
+  a single process run; failed sends are never retried automatically.
+- **WhatsApp:** via `pywhatkit`, which opens a real WhatsApp Web session in
+  your browser — each send is manual by design. On headless servers (no
+  `DISPLAY`) WhatsApp is cleanly disabled with a plain-English message;
+  every other command still works.
+
+## ✅ Tests
+
+```bash
+bash tests/smoke_test.sh          # 11 CLI checks on a throwaway DB (help, stats/status, validation, creds error, no-traceback)
+python tests/test_smtp_unit.py    # SMTP send path + throttle + DB logging, fake in-process SMTP server (no network)
+```
+
+## 🔒 Notes
+
+- **No HTTP endpoint** — this tool exposes nothing to the network, so no API-key
+  auth is needed. Input validation (email/phone/coordinate formats, length
+  caps, parameterized SQL) applies to all CLI inputs and imported CSV/JSON.
+- Outreach templates are plain-text Hindi/English business messages — no AI,
+  no mock/fake sending: `send-email` really delivers via SMTP, `send-whatsapp`
+  really opens WhatsApp Web.
+- Ethical use: uses the free, legal OpenStreetMap API, respects its rate
+  limits, stores data locally, and only contacts leads you have consent to
+  contact. Follow your jurisdiction's anti-spam laws.
 
 ## License
-This project is licensed under the terms provided in the LICENSE file.
 
-## 🐳 Docker Support
-
-Run the system seamlessly using Docker:
-
-`ash
-docker compose build
-docker compose run dispatch --help
-`
+MIT (see LICENSE).

@@ -97,17 +97,46 @@ except ImportError:
     HAVE_REQUESTS = False
     print("⚠️  WARNING: 'requests' not installed. Run: pip install requests")
 
+# NOTE: pywhatkit pulls in pyautogui/mouseinfo, which raises KeyError('DISPLAY')
+# (not ImportError) on headless machines. Catch broadly so WhatsApp stays an
+# optional feature everywhere, with a clean user-facing message instead of a
+# traceback.
 try:
     import pywhatkit as pwt
     HAVE_PYWHATKIT = True
-except ImportError:
+except Exception:  # ImportError, KeyError('DISPLAY'), etc.
     HAVE_PYWHATKIT = False
+    pwt = None  # type: ignore
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION & CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════════
+#
+# All secrets and deployment settings come from environment variables or an
+# optional `.env` file in the working directory (loaded below). No credentials
+# are ever hardcoded. Copy `.env.example` to `.env` to get started.
 
-DB_NAME = "ulwda_production.db"
+def _load_dotenv(path: str = ".env") -> None:
+    """Load KEY=VALUE pairs from a .env file into os.environ (no override)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip("'").strip('"')
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except FileNotFoundError:
+        pass  # .env is optional; plain environment variables also work
+    except OSError:
+        pass
+
+_load_dotenv()
+
+DB_NAME = os.environ.get("LEAD_DISPATCH_DB", "ulwda_production.db")
 VERSION = "2.0.0"
 USER_AGENT = "ULWDA/2.0 (Ethical Business Automation; contact@example.com)"
 
@@ -1230,22 +1259,21 @@ class OutreachManager:
             db.log_event("ERROR", "whatsapp", f"Send failed: {e}")
             return False
     
-    def send_email(self, lead_id: int, template: str, city: str, 
-                   service: str, sender: str = "Team", 
-                   smtp_config: Dict = None):
+    def send_email(self, lead_id: int, template: str, city: str,
+                   service: str, sender: str = "Team",
+                   smtp_config_path: Optional[str] = None):
         """
-        Send email using SMTP
-        
-        smtp_config should contain:
-        {
-            "host": "smtp.gmail.com",
-            "port": 587,
-            "user": "your@gmail.com",
-            "app_password": "xxxx xxxx xxxx xxxx"
-        }
+        Send email using SMTP.
+
+        Credentials come from env vars SMTP_HOST/PORT/USER/PASS (or .env),
+        or a JSON file passed via --smtp-config (same keys: host, port,
+        user, app_password). Outbound emails are throttled to
+        SMTP_MIN_GAP_SECONDS apart.
         """
         import smtplib
         from email.message import EmailMessage
+
+        global _last_email_sent_at
         
         # Get lead details
         conn = db.get_connection()
@@ -1291,19 +1319,14 @@ class OutreachManager:
         print(body)
         print(f"{'='*60}\n")
         
+        # Resolve SMTP credentials: env/.env first, --smtp-config JSON overrides
+        smtp_config, smtp_error = get_smtp_config(smtp_config_path)
+        
         if not smtp_config:
-            print_warning("No SMTP config provided. Email not sent.")
-            print_info("To send emails, create smtp_config.json with:")
-            print('''
-{
-  "host": "smtp.gmail.com",
-  "port": 587,
-  "user": "your@gmail.com",
-  "app_password": "your_app_password"
-}
-''')
-            print_info("Then run with: --smtp-config smtp_config.json")
-            
+            print_error(smtp_error)
+            print_info("Nothing was sent. Set SMTP_HOST/SMTP_USER/SMTP_PASS "
+                       "(see .env.example) or pass --smtp-config smtp.json")
+
             # Still log the attempt
             conn = db.get_connection()
             cur = conn.cursor()
@@ -1317,6 +1340,14 @@ class OutreachManager:
             
             return False
         
+        # Throttle outbound email: min gap between sends (abuse safety)
+        gap = time.time() - _last_email_sent_at
+        if _last_email_sent_at and gap < SMTP_MIN_GAP_SECONDS:
+            wait = SMTP_MIN_GAP_SECONDS - gap
+            print_info(f"Throttling email send: waiting {wait:.0f}s "
+                       f"(SMTP_MIN_GAP_SECONDS={SMTP_MIN_GAP_SECONDS:.0f})")
+            time.sleep(wait)
+
         # Send email
         try:
             msg = EmailMessage()
@@ -1324,7 +1355,7 @@ class OutreachManager:
             msg['From'] = smtp_config['user']
             msg['To'] = lead['email']
             msg.set_content(body)
-            
+
             server = smtplib.SMTP(
                 smtp_config.get('host', 'smtp.gmail.com'),
                 smtp_config.get('port', 587),
@@ -1334,6 +1365,8 @@ class OutreachManager:
             server.login(smtp_config['user'], smtp_config['app_password'])
             server.send_message(msg)
             server.quit()
+
+            _last_email_sent_at = time.time()  # only count successful sends
             
             # Log message
             conn = db.get_connection()
@@ -1371,6 +1404,46 @@ class OutreachManager:
             return False
 
 outreach = OutreachManager()
+
+# ── SMTP configuration & send throttle (env-driven, no hardcoded creds) ─────
+
+# SMTP_MIN_GAP_SECONDS: minimum seconds between two outbound emails in one
+# process run. Prevents accidental bulk-blasting; see README "Rate limits".
+SMTP_MIN_GAP_SECONDS = max(0.0, float(os.environ.get("SMTP_MIN_GAP_SECONDS", "30")))
+_last_email_sent_at = 0.0
+
+
+def get_smtp_config(cli_path: Optional[str] = None) -> Tuple[Optional[Dict], Optional[str]]:
+    """
+    Build SMTP config from environment variables (SMTP_HOST/PORT/USER/PASS),
+    optionally merged with a JSON config file (CLI arg wins for keys it sets).
+
+    Returns (config_dict, error_message). config_dict is None when no usable
+    credentials exist; error_message explains exactly what to set.
+    """
+    config: Dict[str, Any] = {
+        "host": os.environ.get("SMTP_HOST", "").strip(),
+        "port": int(os.environ.get("SMTP_PORT", "587") or 587),
+        "user": os.environ.get("SMTP_USER", "").strip(),
+        "app_password": os.environ.get("SMTP_PASS", ""),
+    }
+    if cli_path:
+        try:
+            with open(cli_path, "r", encoding="utf-8") as f:
+                file_cfg = json.load(f)
+            for k in ("host", "port", "user", "app_password"):
+                if file_cfg.get(k):
+                    config[k] = file_cfg[k]
+        except (OSError, json.JSONDecodeError) as e:
+            return None, f"Failed to load SMTP config file '{cli_path}': {e}"
+    missing = [k for k in ("host", "user", "app_password") if not config.get(k)]
+    if missing:
+        return None, (
+            "SMTP credentials not configured. Set env vars SMTP_HOST, SMTP_USER "
+            "and SMTP_PASS (or copy .env.example to .env), or pass "
+            "--smtp-config <file>."
+        )
+    return config, None
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA EXPORT & REPORTING
@@ -1709,8 +1782,8 @@ For detailed help: ulwda.py <command> --help
     export_parser.add_argument('--type', required=True, choices=['leads', 'workers', 'jobs'], help='Data type to export')
     export_parser.add_argument('--output', help='Output file path (default: <type>_export.csv)')
     
-    # stats command
-    subparsers.add_parser('stats', help='Show system statistics')
+    # stats / status command
+    subparsers.add_parser('stats', aliases=['status'], help='Show system statistics')
     
     # cleanup command
     subparsers.add_parser('cleanup', help='Remove duplicate and invalid entries')
@@ -1761,26 +1834,19 @@ def main():
             job_matcher.match_all_leads(args.service, args.max)
         
         elif args.command == 'send-whatsapp':
-            outreach.send_whatsapp(
+            ok = outreach.send_whatsapp(
                 args.lead_id, args.template,
                 args.city, args.service, args.sender
             )
+            sys.exit(0 if ok else 1)
         
         elif args.command == 'send-email':
-            smtp_config = None
-            if args.smtp_config:
-                try:
-                    with open(args.smtp_config, 'r') as f:
-                        smtp_config = json.load(f)
-                except Exception as e:
-                    print_error(f"Failed to load SMTP config: {e}")
-                    sys.exit(1)
-            
-            outreach.send_email(
+            ok = outreach.send_email(
                 args.lead_id, args.template,
                 args.city, args.service, args.sender,
-                smtp_config
+                args.smtp_config
             )
+            sys.exit(0 if ok else 1)
         
         elif args.command == 'export':
             output_path = args.output or f"{args.type}_export.csv"
@@ -1791,7 +1857,7 @@ def main():
             elif args.type == 'jobs':
                 exporter.export_jobs(output_path)
         
-        elif args.command == 'stats':
+        elif args.command in ('stats', 'status'):
             exporter.show_stats()
         
         elif args.command == 'cleanup':

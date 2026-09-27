@@ -1,9 +1,20 @@
-version: '3.8'
-
 services:
   dispatch:
     build: .
+    # Secrets/config: copy .env.example to .env and fill it in, or set vars in
+    # the environment. The DB lives in the `lead_data` volume so stats survive
+    # container restarts.
+    env_file:
+      - .env
+    environment:
+      LEAD_DISPATCH_DB: /data/ulwda_production.db
     volumes:
-      - ./:/app
-    # To pass arguments, use docker compose run:
-    # docker compose run dispatch --help
+      - lead_data:/data
+      # Uncomment for live code reload during local development:
+      # - ./:/app
+    # Pass CLI arguments, e.g.:
+    #   docker compose run --rm dispatch stats
+    #   docker compose run --rm dispatch collect --city "Mumbai" --service hotel
+
+volumes:
+  lead_data:
