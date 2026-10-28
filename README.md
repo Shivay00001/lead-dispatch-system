@@ -145,3 +145,7 @@ python tests/test_smtp_unit.py    # SMTP send path + throttle + DB logging, fake
 ## License
 
 MIT (see LICENSE).
+
+## Built by VisionQuantech
+
+Part of the [VisionQuantech](https://visionquantech.com/) AI automation studio. See [AI automation services](https://visionquantech.com/ai-automation-services) and the guide to [AI receptionist for dental clinics](https://visionquantech.com/blog/ai-receptionist-for-dental-clinics).
